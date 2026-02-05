@@ -53,6 +53,7 @@ struct iommu_dma_cookie {
 
 static DEFINE_STATIC_KEY_FALSE(iommu_deferred_attach_enabled);
 bool iommu_dma_forcedac __read_mostly;
+bool xsmmu_batch_unmap __read_mostly;
 
 static int __init iommu_dma_forcedac_setup(char *str)
 {
@@ -63,6 +64,17 @@ static int __init iommu_dma_forcedac_setup(char *str)
 	return ret;
 }
 early_param("iommu.forcedac", iommu_dma_forcedac_setup);
+
+static int __init xsmmu_setup(char *str)
+{
+	int ret = kstrtobool(str, &xsmmu_batch_unmap);
+
+	if (!ret && xsmmu_batch_unmap)
+		pr_info("XSMMU batch unmap mode enabled\n");
+	return ret;
+}
+early_param("iommu.xsmmu", xsmmu_setup);
+EXPORT_SYMBOL(xsmmu_batch_unmap);
 
 static void iommu_dma_entry_dtor(unsigned long data)
 {
@@ -505,8 +517,53 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
 	WARN_ON(unmapped != size);
 
-	if (!iotlb_gather.queued)
+	/*
+	 * When xsmmu_batch_unmap is enabled, always perform strict IOTLB
+	 * invalidation for security. This ensures fallback/error paths that
+	 * don't use the _no_sync variants still maintain security by immediately
+	 * invalidating IOTLB entries.
+	 *
+	 * When xsmmu_batch_unmap is disabled, use standard deferred invalidation
+	 * (sync only if not queued to flush queue).
+	 */
+	if (xsmmu_batch_unmap || !iotlb_gather.queued)
 		iommu_iotlb_sync(domain, &iotlb_gather);
+	iommu_dma_free_iova(cookie, dma_addr, size, &iotlb_gather);
+}
+
+/**
+ * __iommu_dma_unmap_no_sync - Unmap without IOTLB invalidation for batching
+ * @dev: device
+ * @dma_addr: DMA address to unmap
+ * @size: size of mapping
+ *
+ * Performs DMA unmap and adds the IOVA to the flush queue without triggering
+ * IOTLB invalidation. This allows batching multiple unmaps followed by a
+ * single domain-wide IOTLB invalidation via iommu_dma_sync_device_iotlb().
+ *
+ * Security note: Pages remain in the flush queue and are not freed until
+ * the IOTLB is synchronized and later fully invalidated (including page walk
+ * cache).
+ */
+static void __iommu_dma_unmap_no_sync(struct device *dev, dma_addr_t dma_addr,
+		size_t size)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	struct iova_domain *iovad = &cookie->iovad;
+	size_t iova_off = iova_offset(iovad, dma_addr);
+	struct iommu_iotlb_gather iotlb_gather;
+	size_t unmapped;
+
+	dma_addr -= iova_off;
+	size = iova_align(iovad, size + iova_off);
+	iommu_iotlb_gather_init(&iotlb_gather);
+	iotlb_gather.queued = READ_ONCE(cookie->fq_domain);
+
+	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
+	WARN_ON(unmapped != size);
+
+	/* Skip IOTLB sync - will be done via explicit sync call */
 	iommu_dma_free_iova(cookie, dma_addr, size, &iotlb_gather);
 }
 
@@ -1321,6 +1378,8 @@ static const struct dma_map_ops iommu_dma_ops = {
 	.get_sgtable		= iommu_dma_get_sgtable,
 	.map_page		= iommu_dma_map_page,
 	.unmap_page		= iommu_dma_unmap_page,
+	.unmap_page_no_sync	= iommu_dma_unmap_swiotlb_no_sync,
+	.sync_device_iotlb	= iommu_dma_sync_device_iotlb,
 	.map_sg			= iommu_dma_map_sg,
 	.unmap_sg		= iommu_dma_unmap_sg,
 	.sync_single_for_cpu	= iommu_dma_sync_single_for_cpu,
@@ -1331,6 +1390,47 @@ static const struct dma_map_ops iommu_dma_ops = {
 	.unmap_resource		= iommu_dma_unmap_resource,
 	.get_merge_boundary	= iommu_dma_get_merge_boundary,
 };
+
+void iommu_dma_unmap_swiotlb_no_sync(struct device *dev, dma_addr_t dma_addr,
+		size_t size, enum dma_data_direction dir,
+		unsigned long attrs)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+	phys_addr_t phys;
+
+	phys = iommu_iova_to_phys(domain, dma_addr);
+	if (WARN_ON(!phys))
+		return;
+
+	__iommu_dma_unmap_no_sync(dev, dma_addr, size);
+
+	if (unlikely(is_swiotlb_buffer(dev, phys)))
+		swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
+}
+EXPORT_SYMBOL_GPL(iommu_dma_unmap_swiotlb_no_sync);
+
+/**
+ * iommu_dma_sync_device_iotlb - Synchronously invalidate domain IOTLB
+ * @dev: device
+ *
+ * Issues domain-wide IOTLB invalidation with invalidation hint set (IH=1),
+ * which skips page walk cache. Waits synchronously for completion.
+ * This ensures the device cannot access unmapped IOVAs while still allowing
+ * pages to remain in flush queue until page walk cache is cleared later.
+ *
+ * Must be called after a batch of dma_unmap_*_no_sync() calls to ensure
+ * security - prevents device from accessing freed memory via stale IOTLB.
+ *
+ * Only functional when xsmmu_batch_unmap mode is enabled (iommu.xsmmu=1).
+ */
+void iommu_dma_sync_device_iotlb(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+
+	if (xsmmu_batch_unmap && domain->ops->sync_domain_iotlb)
+		domain->ops->sync_domain_iotlb(domain);
+}
+EXPORT_SYMBOL_GPL(iommu_dma_sync_device_iotlb);
 
 /*
  * The IOMMU core code allocates the default DMA domain, which the underlying

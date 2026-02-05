@@ -1705,6 +1705,32 @@ static void intel_flush_iotlb_all(struct iommu_domain *domain)
 	}
 }
 
+/**
+ * intel_sync_domain_iotlb - Synchronously invalidate domain IOTLB with hint
+ * @domain: iommu domain
+ *
+ * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
+ * set, which skips page walk cache invalidation. This is used for batch unmap
+ * optimization where:
+ * 1. Multiple pages are unmapped and added to flush queue
+ * 2. This function invalidates IOTLB entries (but not page walk cache)
+ * 3. Pages remain in flush queue until full invalidation clears page walk cache
+ *
+ * Note: Invalidates the entire domain (all devices sharing this domain).
+ */
+static void intel_sync_domain_iotlb(struct iommu_domain *domain)
+{
+	struct dmar_domain *dmar_domain = to_dmar_domain(domain);
+	int idx;
+
+	for_each_domain_iommu(idx, dmar_domain) {
+		struct intel_iommu *iommu = g_iommus[idx];
+		u16 did = dmar_domain->iommu_did[iommu->seq_id];
+
+		qi_flush_domain_iotlb_hint(iommu, did);
+	}
+}
+
 static void iommu_disable_protect_mem_regions(struct intel_iommu *iommu)
 {
 	u32 pmen;
@@ -5571,6 +5597,7 @@ const struct iommu_ops intel_iommu_ops = {
 	.iotlb_sync_map		= intel_iommu_iotlb_sync_map,
 	.flush_iotlb_all        = intel_flush_iotlb_all,
 	.iotlb_sync		= intel_iommu_tlb_sync,
+	.sync_domain_iotlb	= intel_sync_domain_iotlb,
 	.iova_to_phys		= intel_iommu_iova_to_phys,
 	.probe_device		= intel_iommu_probe_device,
 	.probe_finalize		= intel_iommu_probe_finalize,

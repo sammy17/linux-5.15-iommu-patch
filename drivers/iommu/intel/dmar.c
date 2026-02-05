@@ -1511,6 +1511,38 @@ void qi_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 	qi_submit_sync(iommu, &desc, 1, 0);
 }
 
+/**
+ * qi_flush_domain_iotlb_hint - Flush domain IOTLB with invalidation hint
+ * @iommu: intel iommu
+ * @did: domain id
+ *
+ * Performs domain-selective IOTLB invalidation with invalidation hint (IH=1)
+ * set, which skips page walk cache invalidation. Used for batch unmap
+ * optimization where pages remain in flush queue until full invalidation.
+ * Waits synchronously for invalidation completion.
+ */
+void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did)
+{
+	u8 dw = 0, dr = 0;
+	struct qi_desc desc;
+	int ih = 1;  /* Set invalidation hint to skip page walk cache */
+
+	if (cap_write_drain(iommu->cap))
+		dw = 1;
+
+	if (cap_read_drain(iommu->cap))
+		dr = 1;
+
+	/* Domain-selective invalidation (DSI) with IH=1 */
+	desc.qw0 = QI_IOTLB_DID(did) | QI_IOTLB_DR(dr) | QI_IOTLB_DW(dw)
+		| QI_IOTLB_GRAN(DMA_TLB_DSI_FLUSH) | QI_IOTLB_TYPE;
+	desc.qw1 = QI_IOTLB_IH(ih);  /* IH=1, no address/size needed for DSI */
+	desc.qw2 = 0;
+	desc.qw3 = 0;
+
+	qi_submit_sync(iommu, &desc, 1, 0);
+}
+
 void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 			u16 qdep, u64 addr, unsigned mask)
 {
