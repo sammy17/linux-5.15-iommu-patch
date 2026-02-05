@@ -294,6 +294,21 @@ mlx5e_tx_dma_unmap(struct device *pdev, struct mlx5e_sq_dma *dma)
 	}
 }
 
+static inline void
+mlx5e_tx_dma_unmap_no_sync(struct device *pdev, struct mlx5e_sq_dma *dma)
+{
+	switch (dma->type) {
+	case MLX5E_DMA_MAP_SINGLE:
+		dma_unmap_single_no_sync(pdev, dma->addr, dma->size, DMA_TO_DEVICE);
+		break;
+	case MLX5E_DMA_MAP_PAGE:
+		dma_unmap_page_no_sync(pdev, dma->addr, dma->size, DMA_TO_DEVICE);
+		break;
+	default:
+		WARN_ONCE(true, "mlx5e_tx_dma_unmap_no_sync unknown DMA type!\n");
+	}
+}
+
 void mlx5e_sq_xmit_simple(struct mlx5e_txqsq *sq, struct sk_buff *skb, bool xmit_more);
 void mlx5e_tx_mpwqe_ensure_complete(struct mlx5e_txqsq *sq);
 

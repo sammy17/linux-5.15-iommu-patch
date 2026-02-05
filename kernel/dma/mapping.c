@@ -194,6 +194,14 @@ void dma_unmap_page_attrs_no_sync(struct device *dev, dma_addr_t addr,
 }
 EXPORT_SYMBOL_GPL(dma_unmap_page_attrs_no_sync);
 
+void dma_unmap_single_attrs_no_sync(struct device *dev, dma_addr_t addr,
+		size_t size, enum dma_data_direction dir, unsigned long attrs)
+{
+	/* dma_unmap_single is just dma_unmap_page with different debug tracking */
+	return dma_unmap_page_attrs_no_sync(dev, addr, size, dir, attrs);
+}
+EXPORT_SYMBOL_GPL(dma_unmap_single_attrs_no_sync);
+
 void dma_sync_device_iotlb(struct device *dev)
 {
 	const struct dma_map_ops *ops = get_dma_ops(dev);

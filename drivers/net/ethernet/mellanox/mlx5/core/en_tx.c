@@ -40,6 +40,8 @@
 #include "en_accel/en_accel.h"
 #include "en/ptp.h"
 
+extern bool xsmmu_batch_unmap;
+
 static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
 {
 	int i;
@@ -48,8 +50,15 @@ static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
 		struct mlx5e_sq_dma *last_pushed_dma =
 			mlx5e_dma_get(sq, --sq->dma_fifo_pc);
 
-		mlx5e_tx_dma_unmap(sq->pdev, last_pushed_dma);
+		if (xsmmu_batch_unmap)
+			mlx5e_tx_dma_unmap_no_sync(sq->pdev, last_pushed_dma);
+		else
+			mlx5e_tx_dma_unmap(sq->pdev, last_pushed_dma);
 	}
+
+	/* Sync IOTLB after batch unmap in error path */
+	if (xsmmu_batch_unmap && num_dma > 0)
+		dma_sync_device_iotlb(sq->pdev);
 }
 
 #ifdef CONFIG_MLX5_CORE_EN_DCB
@@ -767,8 +776,21 @@ static void mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_in
 	for (i = 0; i < wi->num_dma; i++) {
 		struct mlx5e_sq_dma *dma = mlx5e_dma_get(sq, (*dma_fifo_cc)++);
 
-		mlx5e_tx_dma_unmap(sq->pdev, dma);
+		if (xsmmu_batch_unmap)
+			mlx5e_tx_dma_unmap_no_sync(sq->pdev, dma);
+		else
+			mlx5e_tx_dma_unmap(sq->pdev, dma);
 	}
+
+	/*
+	 * CRITICAL SECURITY: Sync IOTLB immediately after unmapping this WI's
+	 * buffers, BEFORE returning to caller (who will free the skb).
+	 * This ensures IOTLB entries are invalidated before the skb/pages can
+	 * be freed and reused, closing the security window where a malicious
+	 * device could access freed memory via stale IOTLB entries.
+	 */
+	if (xsmmu_batch_unmap && wi->num_dma > 0)
+		dma_sync_device_iotlb(sq->pdev);
 }
 
 static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
