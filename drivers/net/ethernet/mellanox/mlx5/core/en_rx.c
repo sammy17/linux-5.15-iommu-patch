@@ -296,17 +296,88 @@ void mlx5e_page_dma_unmap(struct mlx5e_rq *rq, struct mlx5e_dma_info *dma_info)
 	dma_unmap_page(rq->pdev, dma_info->addr, PAGE_SIZE, rq->buff.map_dir);
 }
 
+static inline void mlx5e_page_dma_unmap_no_sync(struct mlx5e_rq *rq,
+						 struct mlx5e_dma_info *dma_info)
+{
+	dma_unmap_page_no_sync(rq->pdev, dma_info->addr, PAGE_SIZE,
+			       rq->buff.map_dir);
+}
+
+/* Process batched RX page releases: sync IOTLB, then handle pages appropriately */
+void mlx5e_process_rx_release_batch(struct mlx5e_rq *rq)
+{
+	int i;
+
+	if (rq->pending_release_count == 0)
+		return;
+
+	/* Phase 1: Single domain-wide IOTLB invalidation.
+	 * All pages were already unmapped with no_sync during page_release_dynamic.
+	 */
+	dma_sync_device_iotlb(rq->pdev);
+
+	/* Phase 2: Return pages based on their type.
+	 * For recycle pages: return to page_pool.
+	 * For non-recycle pages: release to system.
+	 * Note: We already tried caching these pages in page_release_dynamic()
+	 * and they didn't fit. Don't try again - just recycle/release.
+	 */
+	for (i = 0; i < rq->pending_release_count; i++) {
+		struct mlx5e_dma_info *dma_info =
+			&rq->pending_release[i].dma_info;
+		bool recycle = rq->pending_release[i].recycle;
+
+		if (recycle) {
+			/* Recycle to page_pool (cache was already tried and full) */
+			page_pool_recycle_direct(rq->page_pool, dma_info->page);
+		} else {
+			/* Non-recycle: release to system */
+			page_pool_release_page(rq->page_pool, dma_info->page);
+			put_page(dma_info->page);
+		}
+	}
+
+	rq->pending_release_count = 0;
+}
+
 void mlx5e_page_release_dynamic(struct mlx5e_rq *rq,
 				struct mlx5e_dma_info *dma_info,
 				bool recycle)
 {
 	if (likely(recycle)) {
+		/* Try to cache the page (DMA mapping stays active) */
 		if (mlx5e_rx_cache_put(rq, dma_info))
 			return;
+
+		/* Cache full - need to unmap. Batch if enabled */
+		if (xsmmu_batch_unmap) {
+			/* Flush batch if array is full */
+			if (rq->pending_release_count >= 1024)
+				mlx5e_process_rx_release_batch(rq);
+
+			mlx5e_page_dma_unmap_no_sync(rq, dma_info);
+			rq->pending_release[rq->pending_release_count].dma_info = *dma_info;
+			rq->pending_release[rq->pending_release_count].recycle = true;
+			rq->pending_release_count++;
+			return;
+		}
 
 		mlx5e_page_dma_unmap(rq, dma_info);
 		page_pool_recycle_direct(rq->page_pool, dma_info->page);
 	} else {
+		/* Non-recycle path - batch if enabled */
+		if (xsmmu_batch_unmap) {
+			/* Flush batch if array is full */
+			if (rq->pending_release_count >= 1024)
+				mlx5e_process_rx_release_batch(rq);
+
+			mlx5e_page_dma_unmap_no_sync(rq, dma_info);
+			rq->pending_release[rq->pending_release_count].dma_info = *dma_info;
+			rq->pending_release[rq->pending_release_count].recycle = false;
+			rq->pending_release_count++;
+			return;
+		}
+
 		mlx5e_page_dma_unmap(rq, dma_info);
 		page_pool_release_page(rq->page_pool, dma_info->page);
 		put_page(dma_info->page);
@@ -1586,6 +1657,12 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
 out:
 	if (rcu_access_pointer(rq->xdp_prog))
 		mlx5e_xdp_rx_poll_complete(rq);
+
+	/* Process any batched page releases after poll completes.
+	 * This unmaps all deferred pages, syncs IOTLB once, and handles pages.
+	 */
+	if (xsmmu_batch_unmap)
+		mlx5e_process_rx_release_batch(rq);
 
 	mlx5_cqwq_update_db_record(cqwq);
 

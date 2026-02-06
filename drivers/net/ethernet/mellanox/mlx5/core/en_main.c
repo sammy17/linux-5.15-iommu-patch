@@ -420,6 +420,9 @@ static int mlx5e_alloc_rq(struct mlx5e_params *params,
 	rqp->wq.db_numa_node = node;
 	INIT_WORK(&rq->recover_work, mlx5e_rq_err_cqe_work);
 
+	/* Initialize batch unmap state */
+	rq->pending_release_count = 0;
+
 	if (params->xdp_prog)
 		bpf_prog_inc(params->xdp_prog);
 	RCU_INIT_POINTER(rq->xdp_prog, params->xdp_prog);
@@ -836,6 +839,11 @@ void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
 		}
 	}
 
+	/* CRITICAL: Flush any batched page releases that occurred during cleanup.
+	 * This is a non-datapath cleanup function, so we need to explicitly flush.
+	 */
+	if (xsmmu_batch_unmap)
+		mlx5e_process_rx_release_batch(rq);
 }
 
 int mlx5e_open_rq(struct mlx5e_params *params, struct mlx5e_rq_param *param,
