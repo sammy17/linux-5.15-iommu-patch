@@ -1365,6 +1365,12 @@ static unsigned long iommu_dma_get_merge_boundary(struct device *dev)
 	return (1UL << __ffs(domain->pgsize_bitmap)) - 1;
 }
 
+/* Forward declarations for functions used in iommu_dma_ops */
+void iommu_dma_unmap_swiotlb_no_sync(struct device *dev, dma_addr_t dma_addr,
+		size_t size, enum dma_data_direction dir,
+		unsigned long attrs);
+void iommu_dma_sync_device_iotlb(struct device *dev);
+
 static const struct dma_map_ops iommu_dma_ops = {
 	.alloc			= iommu_dma_alloc,
 	.free			= iommu_dma_free,

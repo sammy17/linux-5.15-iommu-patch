@@ -728,6 +728,7 @@ extern void qi_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 extern void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did);
 extern void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 			u16 qdep, u64 addr, unsigned mask);
+extern void intel_iommu_init_iotlb_stats(void);
 
 void qi_flush_piotlb(struct intel_iommu *iommu, u16 did, u32 pasid, u64 addr,
 		     unsigned long npages, bool ih);
@@ -817,6 +818,7 @@ extern int iommu_calculate_max_sagaw(struct intel_iommu *iommu);
 extern int dmar_disabled;
 extern int intel_iommu_enabled;
 extern int intel_iommu_gfx_mapped;
+extern bool print_iotlb_inv_count;
 #else
 static inline int iommu_calculate_agaw(struct intel_iommu *iommu)
 {

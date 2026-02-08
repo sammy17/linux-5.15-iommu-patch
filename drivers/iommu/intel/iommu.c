@@ -4435,6 +4435,10 @@ int __init intel_iommu_init(void)
 
 	intel_iommu_enabled = 1;
 
+	/* Initialize IOTLB invalidation statistics if enabled */
+	if (print_iotlb_inv_count)
+		intel_iommu_init_iotlb_stats();
+
 	return 0;
 
 out_free_dmar:

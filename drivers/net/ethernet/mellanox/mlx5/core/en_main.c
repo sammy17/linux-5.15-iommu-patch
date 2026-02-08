@@ -67,6 +67,8 @@
 #include "en/ptp.h"
 #include "qos.h"
 #include "en/trap.h"
+
+extern bool xsmmu_batch_unmap;
 #include "fpga/ipsec.h"
 
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)

@@ -29,6 +29,7 @@
 #include <linux/iommu.h>
 #include <linux/numa.h>
 #include <linux/limits.h>
+#include <linux/workqueue.h>
 #include <asm/irq_remapping.h>
 #include <asm/iommu_table.h>
 #include <trace/events/intel_iommu.h>
@@ -62,6 +63,26 @@ LIST_HEAD(dmar_drhd_units);
 struct acpi_table_header * __initdata dmar_tbl;
 static int dmar_dev_scope_status = 1;
 static unsigned long dmar_seq_ids[BITS_TO_LONGS(DMAR_UNITS_SUPPORTED)];
+
+/*
+ * IOTLB invalidation statistics for performance analysis
+ */
+bool print_iotlb_inv_count __read_mostly;
+static atomic64_t iotlb_inv_psi_count;   /* Page-selective invalidations */
+static atomic64_t iotlb_inv_dsi_count;   /* Domain-selective invalidations */
+static atomic64_t iotlb_inv_global_count; /* Global invalidations */
+static atomic64_t iotlb_inv_dsi_xsmmu_count; /* xSMMU DSI with IH=1 */
+static struct delayed_work iotlb_stats_work;
+
+static int __init print_iotlb_inv_count_setup(char *str)
+{
+	int ret = kstrtobool(str, &print_iotlb_inv_count);
+
+	if (!ret && print_iotlb_inv_count)
+		pr_info("IOTLB invalidation counting enabled (10s reporting)\n");
+	return ret;
+}
+early_param("iommu.print_iotlb_inv_count", print_iotlb_inv_count_setup);
 
 static int alloc_iommu(struct dmar_drhd_unit *drhd);
 static void free_iommu(struct intel_iommu *iommu);
@@ -1473,6 +1494,68 @@ void qi_global_iec(struct intel_iommu *iommu)
 	qi_submit_sync(iommu, &desc, 1, 0);
 }
 
+/*
+ * iotlb_stats_work_fn - Periodic handler to print IOTLB invalidation statistics
+ *
+ * Prints statistics every 10 seconds showing the number of each type of IOTLB
+ * invalidation since the last report. This helps evaluate the effectiveness of
+ * xSMMU in reducing IOTLB invalidation overhead.
+ *
+ * Output format:
+ * [IOMMU] 10s stats: PSI=X (X.X/s), DSI=Y (Y.Y/s), DSI_xSMMU=Z (Z.Z/s), Global=W, Total=T (T.T/s)
+ */
+static void iotlb_stats_work_fn(struct work_struct *work)
+{
+	u64 psi, dsi, global, dsi_xsmmu, total;
+	u64 psi_rate, dsi_rate, dsi_xsmmu_rate, total_rate;
+
+	/* Read and reset counters atomically */
+	psi = atomic64_xchg(&iotlb_inv_psi_count, 0);
+	dsi = atomic64_xchg(&iotlb_inv_dsi_count, 0);
+	global = atomic64_xchg(&iotlb_inv_global_count, 0);
+	dsi_xsmmu = atomic64_xchg(&iotlb_inv_dsi_xsmmu_count, 0);
+
+	total = psi + dsi + global;
+
+	/* Calculate rates (per second) with one decimal place precision */
+	psi_rate = psi * 10 / 10;  /* Will be divided by 10 in printk */
+	dsi_rate = dsi * 10 / 10;
+	dsi_xsmmu_rate = dsi_xsmmu * 10 / 10;
+	total_rate = total * 10 / 10;
+
+	pr_info("10s stats: PSI=%llu (%llu.%llu/s), DSI=%llu (%llu.%llu/s), DSI_xSMMU=%llu (%llu.%llu/s), Global=%llu, Total=%llu (%llu.%llu/s)\n",
+		psi, psi / 10, psi % 10,
+		dsi, dsi / 10, dsi % 10,
+		dsi_xsmmu, dsi_xsmmu / 10, dsi_xsmmu % 10,
+		global,
+		total, total / 10, total % 10);
+
+	/* Reschedule for next reporting interval */
+	schedule_delayed_work(&iotlb_stats_work, msecs_to_jiffies(10000));
+}
+
+/**
+ * intel_iommu_init_iotlb_stats - Initialize IOTLB invalidation statistics
+ *
+ * Called during IOMMU initialization when print_iotlb_inv_count is enabled.
+ * Sets up and starts the delayed work that periodically prints invalidation
+ * statistics every 10 seconds.
+ */
+void intel_iommu_init_iotlb_stats(void)
+{
+	/* Initialize counters to zero */
+	atomic64_set(&iotlb_inv_psi_count, 0);
+	atomic64_set(&iotlb_inv_dsi_count, 0);
+	atomic64_set(&iotlb_inv_global_count, 0);
+	atomic64_set(&iotlb_inv_dsi_xsmmu_count, 0);
+
+	/* Initialize and schedule the delayed work */
+	INIT_DELAYED_WORK(&iotlb_stats_work, iotlb_stats_work_fn);
+	schedule_delayed_work(&iotlb_stats_work, msecs_to_jiffies(10000));
+
+	pr_info("IOTLB invalidation statistics enabled, reporting every 10s\n");
+}
+
 void qi_flush_context(struct intel_iommu *iommu, u16 did, u16 sid, u8 fm,
 		      u64 type)
 {
@@ -1509,6 +1592,16 @@ void qi_flush_iotlb(struct intel_iommu *iommu, u16 did, u64 addr,
 	desc.qw3 = 0;
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count invalidation by type for statistics */
+	if (print_iotlb_inv_count) {
+		if (type == DMA_TLB_PSI_FLUSH)
+			atomic64_inc(&iotlb_inv_psi_count);
+		else if (type == DMA_TLB_DSI_FLUSH)
+			atomic64_inc(&iotlb_inv_dsi_count);
+		else if (type == DMA_TLB_GLOBAL_FLUSH)
+			atomic64_inc(&iotlb_inv_global_count);
+	}
 }
 
 /**
@@ -1541,6 +1634,12 @@ void qi_flush_domain_iotlb_hint(struct intel_iommu *iommu, u16 did)
 	desc.qw3 = 0;
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count xSMMU-specific DSI invalidations for statistics */
+	if (print_iotlb_inv_count) {
+		atomic64_inc(&iotlb_inv_dsi_count);
+		atomic64_inc(&iotlb_inv_dsi_xsmmu_count);
+	}
 }
 
 void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
@@ -1563,6 +1662,10 @@ void qi_flush_dev_iotlb(struct intel_iommu *iommu, u16 sid, u16 pfsid,
 	desc.qw3 = 0;
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count device IOTLB invalidation (device-level PSI) */
+	if (print_iotlb_inv_count)
+		atomic64_inc(&iotlb_inv_psi_count);
 }
 
 /* PASID-based IOTLB invalidation */
@@ -1604,6 +1707,10 @@ void qi_flush_piotlb(struct intel_iommu *iommu, u16 did, u32 pasid, u64 addr,
 	}
 
 	qi_submit_sync(iommu, &desc, 1, 0);
+
+	/* Count PASID-based IOTLB invalidation (treated as PSI) */
+	if (print_iotlb_inv_count)
+		atomic64_inc(&iotlb_inv_psi_count);
 }
 
 /* PASID-based device IOTLB Invalidate */
